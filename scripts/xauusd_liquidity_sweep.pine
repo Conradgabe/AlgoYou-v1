@@ -1,0 +1,627 @@
+// ============================================================
+// XAUUSD Liquidity Sweep Map
+// ============================================================
+// Not a generic indicator. Not RSI. Not EMA crossovers.
+//
+// This shows WHERE liquidity sits and WHEN it gets grabbed:
+//   1. Asian session range (the trap)
+//   2. Liquidity sweeps above/below that range (the grab)
+//   3. Displacement reversals after the sweep (the real move)
+//   4. Fair Value Gaps (price imbalances that tend to fill)
+//   5. Previous day high/low (major liquidity pools)
+//
+// Entries happen during London/NY when the sweep reverses.
+// No auto buy/sell. This is the map. You make the call.
+//
+// Timeframe: 5m or 15m
+// ============================================================
+
+//@version=5
+indicator("XAUUSD Liquidity Sweep", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ────────────────────────────────────────────────────────────
+// INPUTS
+// ────────────────────────────────────────────────────────────
+
+// Sessions in OANDA exchange timezone (America/New_York = EDT)
+// Confirmed: OANDA uses NY time. EDT = UTC-4.
+//
+// Range builds during QUIET hours only (Sydney + very early Tokyo)
+// Then locks BEFORE Tokyo gets active — so Tokyo/London/NY moves = sweeps
+//
+// Quiet period: 18:00-22:00 EDT = 22:00-02:00 UTC (4 hours, low volatility)
+// Tokyo active: 22:00-03:00 EDT = 02:00-07:00 UTC (NOT in range — sweeps here)
+// London:       04:00-09:00 EDT = 08:00-13:00 UTC
+// New York:     09:00-14:00 EDT = 13:00-18:00 UTC
+asianStart    = input.session("1800-2200", "Quiet Range (EDT)",  group="Sessions",
+     tooltip="Range-building window only. Intentionally short (4h) to capture quiet hours before Tokyo gets active.")
+londonStart   = input.session("0400-1300", "London (EDT)",       group="Sessions",
+     tooltip="Full London session: 08:00-17:00 UTC = 04:00-13:00 EDT")
+nyStart       = input.session("0900-1800", "New York (EDT)",     group="Sessions",
+     tooltip="Full NY session: 13:00-22:00 UTC = 09:00-18:00 EDT")
+showSessBG    = input.bool(true, "Session Background Colors",  group="Sessions")
+
+// Sweep detection
+sweepWickMin  = input.float(0.3, "Min Sweep Wick (x ATR)",    minval=0.1, maxval=2.0, step=0.1, group="Sweep",
+     tooltip="How far price must poke beyond the Asian range to count as a sweep. Measured in ATR units.")
+atrLen        = input.int(14,    "ATR Length",                 minval=5,  maxval=30,  group="Sweep")
+
+// Displacement
+dispBodyMult  = input.float(1.0, "Displacement Body (x avg)", minval=0.5, maxval=4.0, step=0.1, group="Displacement",
+     tooltip="A displacement candle must have a body at least this many times the average body size. Lower = more signals.")
+dispWickRatio = input.float(0.5, "Max Wick/Range Ratio",      minval=0.1, maxval=0.8, step=0.05, group="Displacement",
+     tooltip="Displacement candles have small wicks relative to range. Higher = more signals.")
+dispLookback  = input.int(8,     "Bars After Sweep to Look",  minval=3,   maxval=20,  group="Displacement",
+     tooltip="How many bars after a sweep to watch for a displacement candle.")
+
+// Fair Value Gaps
+showFVG       = input.bool(false, "Show Fair Value Gaps",     group="FVG")
+fvgMaxAge     = input.int(50,     "FVG Max Age (bars)",       minval=10, maxval=200, group="FVG")
+
+// Previous Day
+showPrevDay   = input.bool(true, "Show Previous Day High/Low", group="Levels")
+
+// Show/Hide Labels
+showSweepLabels   = input.bool(true,  "Show Sweep Labels",         group="Labels")
+showSweepX        = input.bool(true,  "Show Sweep X Markers",      group="Labels")
+showDispLabels    = input.bool(true,  "Show Displacement Labels",   group="Labels")
+showContLabels    = input.bool(true,  "Show Continuation Labels",   group="Labels")
+showDiamonds      = input.bool(false, "Show Standalone Diamonds",   group="Labels")
+
+// Alerts
+alertSweepHigh = input.bool(true, "Alert on High Sweep",      group="Alerts")
+alertSweepLow  = input.bool(true, "Alert on Low Sweep",       group="Alerts")
+
+// ────────────────────────────────────────────────────────────
+// SESSION DETECTION
+// ────────────────────────────────────────────────────────────
+
+inAsian  = not na(time(timeframe.period, asianStart))
+inLondon = not na(time(timeframe.period, londonStart))
+inNY     = not na(time(timeframe.period, nyStart))
+inKillZone = inLondon or inNY
+
+bgcolor(showSessBG and inAsian  ? color.new(#2a2a3e, 85) : na, title="Asian BG")
+bgcolor(showSessBG and inLondon ? color.new(#1a2a4a, 85) : na, title="London BG")
+bgcolor(showSessBG and inNY     ? color.new(#3a2a1a, 85) : na, title="NY BG")
+
+// ────────────────────────────────────────────────────────────
+// ASIAN SESSION RANGE (THE TRAP)
+// ────────────────────────────────────────────────────────────
+
+var float asianHigh = na
+var float asianLow  = na
+var bool  asianLocked = false
+
+// Reset at start of Asian session
+asianJustStarted = inAsian and not inAsian[1]
+if asianJustStarted
+    asianHigh  := high
+    asianLow   := low
+    asianLocked := false
+
+// Build range during Asian session
+if inAsian and not asianLocked
+    asianHigh := math.max(nz(asianHigh, high), high)
+    asianLow  := math.min(nz(asianLow, low), low)
+
+// Lock range when Asian ends
+asianJustEnded = not inAsian and inAsian[1]
+if asianJustEnded
+    asianLocked := true
+
+// Draw Asian range as lines (current day only — no historical clutter)
+asianHighColor = color.new(#ff5252, 30)
+asianLowColor  = color.new(#4caf50, 30)
+asianMidColor  = color.new(color.gray, 60)
+
+var line asianHighLine = na
+var line asianLowLine  = na
+var line asianMidLine  = na
+var int  asianLockBar  = na
+
+// Create new lines when range locks, delete old ones
+if asianJustEnded
+    // Delete previous day's lines
+    line.delete(asianHighLine)
+    line.delete(asianLowLine)
+    line.delete(asianMidLine)
+    asianLockBar := bar_index
+    asianHighLine := line.new(bar_index, asianHigh, bar_index + 1, asianHigh, color=asianHighColor, width=2, extend=extend.right)
+    asianLowLine  := line.new(bar_index, asianLow,  bar_index + 1, asianLow,  color=asianLowColor,  width=2, extend=extend.right)
+    asianMidLine  := line.new(bar_index, (asianHigh + asianLow) / 2, bar_index + 1, (asianHigh + asianLow) / 2, color=asianMidColor, width=1, style=line.style_dotted, extend=extend.right)
+
+// Stop extending when next Asian session starts (clean cutoff)
+if asianJustStarted
+    if not na(asianHighLine)
+        line.set_extend(asianHighLine, extend.none)
+        line.set_x2(asianHighLine, bar_index)
+    if not na(asianLowLine)
+        line.set_extend(asianLowLine, extend.none)
+        line.set_x2(asianLowLine, bar_index)
+    if not na(asianMidLine)
+        line.set_extend(asianMidLine, extend.none)
+        line.set_x2(asianMidLine, bar_index)
+
+// ────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH / LOW (MAJOR LIQUIDITY POOLS)
+// ────────────────────────────────────────────────────────────
+
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+prevDayLow  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+// Draw prev day H/L as single lines (current day only)
+var line prevDayHighLine = na
+var line prevDayLowLine  = na
+
+isNewDay = ta.change(time("D")) != 0
+
+if isNewDay and showPrevDay
+    line.delete(prevDayHighLine)
+    line.delete(prevDayLowLine)
+    prevDayHighLine := line.new(bar_index, prevDayHigh, bar_index + 1, prevDayHigh,
+         color=color.new(#ff8a80, 40), width=1, style=line.style_dashed, extend=extend.right)
+    prevDayLowLine  := line.new(bar_index, prevDayLow,  bar_index + 1, prevDayLow,
+         color=color.new(#80cbc4, 40), width=1, style=line.style_dashed, extend=extend.right)
+
+// ────────────────────────────────────────────────────────────
+// SWEEP DETECTION
+// Price pokes beyond Asian range then closes back inside
+// ────────────────────────────────────────────────────────────
+
+atrValue = ta.atr(atrLen)
+sweepThreshold = atrValue * sweepWickMin
+
+// Track whether price has EVER gone beyond the Asian range today
+var bool priceWentAboveAsian = false
+var bool priceWentBelowAsian = false
+var bool highSweepToday = false
+var bool lowSweepToday  = false
+
+if asianJustStarted
+    priceWentAboveAsian := false
+    priceWentBelowAsian := false
+    highSweepToday := false
+    lowSweepToday  := false
+
+// Detect price going beyond the range — no session filter here
+// Sweeps are structural: they happen regardless of what session the clock says
+if asianLocked and high > asianHigh + sweepThreshold
+    priceWentAboveAsian := true
+
+if asianLocked and low < asianLow - sweepThreshold
+    priceWentBelowAsian := true
+
+// SWEEP confirmed when price went above/below AND now closes back inside
+highSwept = asianLocked and
+     priceWentAboveAsian and
+     close < asianHigh and
+     not highSweepToday
+
+lowSwept = asianLocked and
+     priceWentBelowAsian and
+     close > asianLow and
+     not lowSweepToday
+
+firstHighSweep = highSwept
+firstLowSweep  = lowSwept
+
+if highSwept
+    highSweepToday := true
+if lowSwept
+    lowSweepToday  := true
+
+// Mark sweeps on chart (X markers)
+plotshape(showSweepX and firstHighSweep, "High Sweep", shape.xcross, location.abovebar,
+     color=color.new(#ff5252, 0), size=size.normal)
+plotshape(showSweepX and firstLowSweep,  "Low Sweep",  shape.xcross, location.belowbar,
+     color=color.new(#4caf50, 0), size=size.normal)
+
+// Labels for sweeps
+if firstHighSweep and showSweepLabels
+    label.new(bar_index, high + atrValue * 0.3,
+         "SWEEP HIGH",
+         style=label.style_label_down, color=color.new(#ff5252, 10),
+         textcolor=color.white, size=size.small)
+
+if firstLowSweep and showSweepLabels
+    label.new(bar_index, low - atrValue * 0.3,
+         "SWEEP LOW",
+         style=label.style_label_up, color=color.new(#4caf50, 10),
+         textcolor=color.white, size=size.small)
+
+// ────────────────────────────────────────────────────────────
+// TREND FILTER (Market Structure)
+// ────────────────────────────────────────────────────────────
+// Uses swing highs/lows to determine trend direction.
+// Higher highs + higher lows = bullish → block sells
+// Lower highs + lower lows = bearish → block buys
+// This is market structure, not a lagging indicator.
+
+trendSwingLen = input.int(5, "Trend Swing Length", minval=2, maxval=15, group="Trend Filter",
+     tooltip="Bars on each side to confirm swing points for trend detection. Higher = smoother trend, fewer flips.")
+useTrendFilter = input.bool(false, "Hard Block Counter-Trend", group="Trend Filter",
+     tooltip="When ON: blocks counter-trend signals entirely. When OFF (recommended): labels signals as WITH-TREND or COUNTER-TREND but allows all.")
+
+// Detect swing pivots
+trendSwingHigh = ta.pivothigh(high, trendSwingLen, trendSwingLen)
+trendSwingLow  = ta.pivotlow(low, trendSwingLen, trendSwingLen)
+
+// Track last two swing highs and last two swing lows
+var float currSwingHigh = na
+var float prevSwingHigh = na
+var float currSwingLow  = na
+var float prevSwingLow  = na
+
+if not na(trendSwingHigh)
+    prevSwingHigh := currSwingHigh
+    currSwingHigh := trendSwingHigh
+
+if not na(trendSwingLow)
+    prevSwingLow := currSwingLow
+    currSwingLow := trendSwingLow
+
+// Determine structure
+higherHigh = not na(currSwingHigh) and not na(prevSwingHigh) and currSwingHigh > prevSwingHigh
+higherLow  = not na(currSwingLow) and not na(prevSwingLow) and currSwingLow > prevSwingLow
+lowerHigh  = not na(currSwingHigh) and not na(prevSwingHigh) and currSwingHigh < prevSwingHigh
+lowerLow   = not na(currSwingLow) and not na(prevSwingLow) and currSwingLow < prevSwingLow
+
+// Trend state: bullish needs HH+HL, bearish needs LH+LL
+var int structureTrend = 0  // 1=bullish, -1=bearish, 0=neutral
+
+if higherHigh and higherLow
+    structureTrend := 1
+if lowerHigh and lowerLow
+    structureTrend := -1
+// Mixed signals (HH+LL or LH+HL) = keep previous trend (don't flip on noise)
+
+// Filter: allow signals only WITH the trend
+trendAllowBuy  = useTrendFilter ? structureTrend >= 0 : true   // buy allowed in bullish or neutral
+trendAllowSell = useTrendFilter ? structureTrend <= 0 : true   // sell allowed in bearish or neutral
+
+// ────────────────────────────────────────────────────────────
+// DISPLACEMENT DETECTION
+// Strong-body, small-wick candle after a sweep = institutional reversal
+// ────────────────────────────────────────────────────────────
+
+bodySize    = math.abs(close - open)
+candleRange = high - low
+avgBody     = ta.sma(bodySize, 20)
+
+isDisplacement = bodySize > avgBody * dispBodyMult and
+     candleRange > 0 and
+     (math.max(high - close, high - open) / candleRange < dispWickRatio or
+      math.min(close - low, open - low) / candleRange < dispWickRatio)
+
+bullDisplacement = isDisplacement and close > open  // big green, small wicks
+bearDisplacement = isDisplacement and close < open  // big red, small wicks
+
+// Displacement AFTER a sweep = the real move
+// Bearish displacement within 3 bars after high sweep
+recentHighSweep = ta.barssince(firstHighSweep) <= dispLookback and ta.barssince(firstHighSweep) >= 0
+recentLowSweep  = ta.barssince(firstLowSweep) <= dispLookback and ta.barssince(firstLowSweep) >= 0
+
+// Track whether displacement already fired for this sweep (ONE per sweep)
+var bool bearDispFired = false
+var bool bullDispFired = false
+
+if firstHighSweep
+    bearDispFired := false   // reset on new sweep
+if firstLowSweep
+    bullDispFired := false   // reset on new sweep
+if asianJustStarted
+    bearDispFired := false
+    bullDispFired := false
+
+// ── INVERTED SIGNAL LOGIC ──
+// Gold trends strongly. Sweep + displacement = pullback in a breakout, NOT a reversal.
+// So we INVERT:
+//   Sweep HIGH + bearish displacement = pullback after breakout up → BUY signal
+//   Sweep LOW  + bullish displacement = bounce after breakdown down → SELL signal
+
+highSweepDisp = bearDisplacement and recentHighSweep and inKillZone and not bearDispFired and trendAllowBuy
+lowSweepDisp  = bullDisplacement and recentLowSweep and inKillZone and not bullDispFired and trendAllowSell
+
+if highSweepDisp
+    bearDispFired := true
+if lowSweepDisp
+    bullDispFired := true
+
+// Trend context — now aligned with inverted logic
+buyWithTrend     = highSweepDisp and structureTrend >= 0   // buy after high sweep in bullish = with trend
+buyCounterTrend  = highSweepDisp and structureTrend < 0    // buy after high sweep in bearish = counter trend
+sellWithTrend    = lowSweepDisp and structureTrend <= 0    // sell after low sweep in bearish = with trend
+sellCounterTrend = lowSweepDisp and structureTrend > 0     // sell after low sweep in bullish = counter trend
+
+// Bar coloring
+barcolor(buyWithTrend     ? color.new(#00e676, 0)  : na, title="Buy With Trend")
+barcolor(buyCounterTrend  ? color.new(#00bcd4, 0)  : na, title="Buy Counter Trend")
+barcolor(sellWithTrend    ? color.new(#ff1744, 0)  : na, title="Sell With Trend")
+barcolor(sellCounterTrend ? color.new(#ff9800, 0)  : na, title="Sell Counter Trend")
+
+// Labels
+if buyWithTrend and showDispLabels
+    label.new(bar_index, low - atrValue * 0.5,
+         "BUY ★",
+         style=label.style_label_up, color=color.new(#00e676, 0),
+         textcolor=color.white, size=size.normal)
+
+if buyCounterTrend and showDispLabels
+    label.new(bar_index, low - atrValue * 0.5,
+         "BUY ⚠",
+         style=label.style_label_up, color=color.new(#00bcd4, 0),
+         textcolor=color.white, size=size.normal)
+
+if sellWithTrend and showDispLabels
+    label.new(bar_index, high + atrValue * 0.5,
+         "SELL ★",
+         style=label.style_label_down, color=color.new(#ff1744, 0),
+         textcolor=color.white, size=size.normal)
+
+if sellCounterTrend and showDispLabels
+    label.new(bar_index, high + atrValue * 0.5,
+         "SELL ⚠",
+         style=label.style_label_down, color=color.new(#ff9800, 0),
+         textcolor=color.white, size=size.normal)
+
+// ────────────────────────────────────────────────────────────
+// FAILED DISPLACEMENT = TREND CONTINUATION SIGNAL
+// ────────────────────────────────────────────────────────────
+// When a SELL DISPLACEMENT fires but price doesn't follow through
+// downward (fails within N bars), it means the sell was a shakeout
+// in a bullish trend. The failure IS the buy signal.
+// Opposite for failed BUY DISPLACEMENT in a bearish trend.
+
+failBars = input.int(12, "Failure Confirmation Bars", minval=2, maxval=30, group="Continuation",
+     tooltip="After a displacement, how many bars to wait. If price closes beyond the displacement candle, the displacement failed. 12 bars = 3 hours on 15m.")
+showContinuation = input.bool(true, "Show Continuation Signals", group="Continuation")
+failBuffer = input.float(0.5, "Failure Buffer (x ATR)", minval=0.1, maxval=2.0, step=0.1, group="Continuation",
+     tooltip="How far past the signal candle price must close to count as a failure. 0.5 = half an ATR. Filters out noise.")
+
+// Track signal prices for failure detection
+// With inverted signals:
+//   BUY signal comes from high sweep + bearish displacement → track if price drops below displacement low (buy failed)
+//   SELL signal comes from low sweep + bullish displacement → track if price rises above displacement high (sell failed)
+var float buySignalPrice  = na
+var float buySignalLow    = na   // if price drops below this, buy failed
+var float sellSignalPrice = na
+var float sellSignalHigh  = na   // if price rises above this, sell failed
+var int   buySignalBar    = na
+var int   sellSignalBar   = na
+var bool  buyFailFired    = false
+var bool  sellFailFired   = false
+
+if highSweepDisp   // BUY signal fired (inverted: bearish disp after high sweep = buy)
+    buySignalPrice := close
+    buySignalLow   := low
+    buySignalBar   := bar_index
+    buyFailFired   := false
+
+if lowSweepDisp    // SELL signal fired (inverted: bullish disp after low sweep = sell)
+    sellSignalPrice := close
+    sellSignalHigh  := high
+    sellSignalBar   := bar_index
+    sellFailFired   := false
+
+if asianJustStarted
+    buyFailFired  := false
+    sellFailFired := false
+
+// FAILED BUY → SELL CONTINUATION
+// Buy signal fired but price drops significantly below the signal candle's low
+// Requires close below low minus buffer (half ATR by default) to filter noise
+barsSinceBuySignal = not na(buySignalBar) ? bar_index - buySignalBar : 999
+buyFailed = showContinuation and
+     not na(buySignalPrice) and
+     barsSinceBuySignal >= 1 and
+     barsSinceBuySignal <= failBars and
+     close < buySignalLow - atrValue * failBuffer and
+     not buyFailFired
+
+// FAILED SELL → BUY CONTINUATION
+// Sell signal fired but price rises significantly above the signal candle's high
+barsSinceSellSignal = not na(sellSignalBar) ? bar_index - sellSignalBar : 999
+sellFailed = showContinuation and
+     not na(sellSignalPrice) and
+     barsSinceSellSignal >= 1 and
+     barsSinceSellSignal <= failBars and
+     close > sellSignalHigh + atrValue * failBuffer and
+     not sellFailFired
+
+if buyFailed
+    buyFailFired := true
+if sellFailed
+    sellFailFired := true
+
+// Labels for continuation signals
+if sellFailed and showContLabels
+    label.new(bar_index, low - atrValue * 0.5,
+         "BUY CONT",
+         style=label.style_label_up, color=color.new(#00bcd4, 0),
+         textcolor=color.white, size=size.normal)
+
+if buyFailed and showContLabels
+    label.new(bar_index, high + atrValue * 0.5,
+         "SELL CONT",
+         style=label.style_label_down, color=color.new(#ff9800, 0),
+         textcolor=color.white, size=size.normal)
+
+// Color bars for continuation signals
+barcolor(sellFailed ? color.new(#00bcd4, 0) : na, title="Buy Continuation")
+barcolor(buyFailed  ? color.new(#ff9800, 0) : na, title="Sell Continuation")
+
+// ────────────────────────────────────────────────────────────
+// FAIR VALUE GAPS (price imbalances that tend to fill)
+// ────────────────────────────────────────────────────────────
+
+// Bullish FVG: candle[2] high < candle[0] low (gap up, imbalance)
+bullFVG_top    = low
+bullFVG_bottom = high[2]
+bullFVG_exists = showFVG and low > high[2] and close[1] > open[1]
+
+// Bearish FVG: candle[2] low > candle[0] high (gap down, imbalance)
+bearFVG_top    = low[2]
+bearFVG_bottom = high
+bearFVG_exists = showFVG and high < low[2] and close[1] < open[1]
+
+// Draw FVG boxes
+if bullFVG_exists
+    box.new(bar_index - 1, bullFVG_top, bar_index + fvgMaxAge, bullFVG_bottom,
+         border_color=color.new(#4caf50, 60),
+         bgcolor=color.new(#4caf50, 88),
+         text="FVG", text_color=color.new(#4caf50, 50), text_size=size.tiny)
+
+if bearFVG_exists
+    box.new(bar_index - 1, bearFVG_top, bar_index + fvgMaxAge, bearFVG_bottom,
+         border_color=color.new(#ff5252, 60),
+         bgcolor=color.new(#ff5252, 88),
+         text="FVG", text_color=color.new(#ff5252, 50), text_size=size.tiny)
+
+// ────────────────────────────────────────────────────────────
+// STANDALONE DISPLACEMENT CANDLES (no sweep required)
+// These show institutional participation anywhere on the chart
+// ────────────────────────────────────────────────────────────
+
+// Small markers for displacement candles that aren't tied to sweeps
+standaloneBullDisp = showDiamonds and bullDisplacement and not lowSweepDisp and inKillZone
+standaloneBearDisp = showDiamonds and bearDisplacement and not highSweepDisp and inKillZone
+
+plotshape(standaloneBullDisp, "Bull Displacement", shape.diamond, location.belowbar,
+     color=color.new(#00e676, 50), size=size.tiny)
+plotshape(standaloneBearDisp, "Bear Displacement", shape.diamond, location.abovebar,
+     color=color.new(#ff1744, 50), size=size.tiny)
+
+// ────────────────────────────────────────────────────────────
+// DASHBOARD
+// ────────────────────────────────────────────────────────────
+
+if barstate.islast
+    var table d = table.new(position.top_right, 2, 9,
+         bgcolor=color.new(color.black, 10),
+         border_color=color.new(color.gray, 50), border_width=1,
+         frame_color=color.new(color.gray, 30), frame_width=2)
+
+    gn = #4caf50
+    rd = #ff5252
+    yl = color.yellow
+    wh = color.white
+    gr = color.gray
+
+    table.cell(d, 0, 0, "LIQUIDITY", text_color=yl, text_size=size.normal, bgcolor=color.new(color.black, 0))
+    table.cell(d, 1, 0, syminfo.timezone, text_color=color.orange, text_size=size.small, bgcolor=color.new(color.black, 0))
+
+    // Session — show actual session based on time, separate from range state
+    sess = inLondon ? "LONDON" : inNY ? "NEW YORK" : inAsian ? "ASIAN" : "OFF HOURS"
+    sessClr = inLondon ? color.blue : inNY ? color.orange : inAsian ? gr : color.new(gr, 50)
+    table.cell(d, 0, 1, "Session",     text_color=wh, text_size=size.small)
+    table.cell(d, 1, 1, sess,          text_color=sessClr, text_size=size.small)
+
+    // Asian range — show locked range, or "building" if in Asian, or "waiting" if no range yet
+    rangeStr = asianLocked ? str.tostring(asianHigh, "#.##") + " / " + str.tostring(asianLow, "#.##") :
+               inAsian ? "Building..." : "Waiting for Asian"
+    table.cell(d, 0, 2, "Asian Range", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 2, rangeStr,      text_color=asianLocked ? wh : gr, text_size=size.small)
+
+    // Range size
+    rangePips = asianLocked ? str.tostring((asianHigh - asianLow), "#.##") : "—"
+    table.cell(d, 0, 3, "Range Size",  text_color=wh, text_size=size.small)
+    table.cell(d, 1, 3, "$" + rangePips, text_color=wh, text_size=size.small)
+
+    // Price position
+    posStr = not asianLocked ? "—" :
+             close > asianHigh ? "ABOVE RANGE" :
+             close < asianLow ? "BELOW RANGE" : "INSIDE RANGE"
+    posClr = not asianLocked ? gr :
+             close > asianHigh ? rd :
+             close < asianLow ? gn : gr
+    table.cell(d, 0, 4, "Price vs Range", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 4, posStr,           text_color=posClr, text_size=size.small)
+
+    // Structure trend
+    trendStr = structureTrend == 1 ? "BULLISH (HH+HL)" : structureTrend == -1 ? "BEARISH (LH+LL)" : "NEUTRAL"
+    trendClr = structureTrend == 1 ? gn : structureTrend == -1 ? rd : gr
+    table.cell(d, 0, 5, "Structure", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 5, trendStr,    text_color=trendClr, text_size=size.small)
+
+    // Sweep status
+    sweepStr = highSweepToday and lowSweepToday ? "BOTH SWEPT" :
+               highSweepToday ? "HIGH SWEPT" :
+               lowSweepToday ? "LOW SWEPT" : "NO SWEEP YET"
+    sweepClr = highSweepToday or lowSweepToday ? yl : gr
+    table.cell(d, 0, 6, "Sweep Status", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 6, sweepStr,       text_color=sweepClr, text_size=size.small)
+
+    // Prev day levels
+    table.cell(d, 0, 7, "Prev Day H/L", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 7, str.tostring(prevDayHigh, "#.##") + " / " + str.tostring(prevDayLow, "#.##"),
+         text_color=wh, text_size=size.small)
+
+    // What to watch — now trend-aware
+    watchStr = inAsian ? "Range building — wait" :
+               not asianLocked ? "No Asian range yet — wait" :
+               highSweepToday and trendAllowSell ? "High swept + bearish structure — watch for SELL displacement" :
+               highSweepToday and not trendAllowSell ? "High swept but BULLISH — sell blocked, watch for BUY continuation" :
+               lowSweepToday and trendAllowBuy ? "Low swept + bullish structure — watch for BUY displacement" :
+               lowSweepToday and not trendAllowBuy ? "Low swept but BEARISH — buy blocked, watch for SELL continuation" :
+               inKillZone ? "Waiting for sweep of Asian range" : "Off hours"
+    table.cell(d, 0, 8, "WATCH FOR", text_color=yl, text_size=size.normal, bgcolor=color.new(color.black, 0))
+    table.cell(d, 1, 8, watchStr,    text_color=wh, text_size=size.small,  bgcolor=color.new(color.black, 0))
+
+// ────────────────────────────────────────────────────────────
+// ALERTS
+// ────────────────────────────────────────────────────────────
+
+alertcondition(firstHighSweep, "Asian High Swept", "XAUUSD: Asian high liquidity grabbed — watch for bearish displacement")
+alertcondition(firstLowSweep,  "Asian Low Swept",  "XAUUSD: Asian low liquidity grabbed — watch for bullish displacement")
+alertcondition(lowSweepDisp,   "Sell Signal",  "XAUUSD: Low sweep + bullish displacement — SELL (inverted)")
+alertcondition(highSweepDisp,  "Buy Signal",   "XAUUSD: High sweep + bearish displacement — BUY (inverted)")
+alertcondition(sellFailed,     "Buy Continuation",  "XAUUSD: Sell displacement FAILED — buy continuation in uptrend")
+alertcondition(buyFailed,      "Sell Continuation",  "XAUUSD: Buy displacement FAILED — sell continuation in downtrend")
+
+// ────────────────────────────────────────────────────────────
+// READING THE CHART
+// ────────────────────────────────────────────────────────────
+//
+// COLORS:
+//   Dark purple background  = Asian session (range building, don't trade)
+//   Dark blue background    = London session (primary kill zone)
+//   Dark orange background  = NY session (secondary kill zone)
+//
+// LINES:
+//   Red horizontal    = Asian session high (sell-side liquidity above)
+//   Green horizontal  = Asian session low (buy-side liquidity below)
+//   Gray horizontal   = Asian midpoint
+//   Faded red step    = Previous day high (major liquidity)
+//   Faded green step  = Previous day low (major liquidity)
+//
+// MARKERS:
+//   Red X above bar       = Asian high was swept (stops grabbed)
+//   Green X below bar     = Asian low was swept (stops grabbed)
+//   Bright red bar        = Bearish displacement after high sweep (SELL setup)
+//   Bright green bar      = Bullish displacement after low sweep (BUY setup)
+//   Small green diamond   = Bullish displacement (no sweep, just institutional candle)
+//   Small red diamond     = Bearish displacement (no sweep, just institutional candle)
+//
+// BOXES:
+//   Green shaded box = Bullish Fair Value Gap (price may return here)
+//   Red shaded box   = Bearish Fair Value Gap (price may return here)
+//
+// HOW TO USE:
+//   1. Wait for Asian session to complete (range locked)
+//   2. During London/NY, watch for price to sweep above Asian high or below Asian low
+//   3. After the sweep, look for a displacement candle in the OPPOSITE direction
+//   4. That displacement is your entry signal
+//   5. Stop loss: beyond the sweep wick
+//   6. Target: opposite side of Asian range, or a Fair Value Gap
+//
+// EXAMPLE:
+//   Asian range: $4,420 - $4,440
+//   London opens, price spikes to $4,447 (sweeps Asian high by $7)
+//   Red X appears: "SWEEP HIGH"
+//   Next candle: big red body, tiny wicks, closes at $4,432
+//   Bar turns bright red: "SELL DISPLACEMENT - Sweep + Reversal"
+//   → Entry: short at $4,432
+//   → Stop: above the sweep wick ($4,450)
+//   → Target: Asian low ($4,420) or FVG below
+// ============================================================

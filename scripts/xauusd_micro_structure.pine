@@ -1,0 +1,335 @@
+// ============================================================
+// XAUUSD Micro Structure — Order Blocks + Break of Structure
+// ============================================================
+// For 1m / 3m scalping. Shows micro-trend shifts and
+// institutional entry zones.
+//
+//   BOS  = Break of Structure (trend continuation)
+//   ChoCH = Change of Character (trend reversal)
+//   OB   = Order Block (institutional entry zone)
+//
+// Use WITH the Liquidity Sweep indicator:
+//   Sweep Map = daily context (which direction to trade)
+//   This      = micro execution (when to pull the trigger)
+//
+// Timeframe: 1m or 3m
+// ============================================================
+
+//@version=5
+indicator("XAUUSD Micro Structure", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500)
+
+// ────────────────────────────────────────────────────────────
+// INPUTS
+// ────────────────────────────────────────────────────────────
+
+swingLen      = input.int(3,     "Swing Detection Length",   minval=2, maxval=10, group="Structure",
+     tooltip="Bars on each side to confirm a swing high/low. Lower = more sensitive, higher = fewer but stronger swings.")
+
+showBOS       = input.bool(true, "Show Break of Structure",  group="Structure")
+showChoCH     = input.bool(true, "Show Change of Character", group="Structure")
+
+showOB        = input.bool(true, "Show Order Blocks",        group="Order Blocks")
+obMaxAge      = input.int(50,    "OB Max Age (bars)",        minval=10, maxval=200, group="Order Blocks",
+     tooltip="Order blocks older than this are removed.")
+obMitigated   = input.bool(true, "Remove Mitigated OBs",    group="Order Blocks",
+     tooltip="Remove order block when price returns and trades through it.")
+
+showVolSpike  = input.bool(true, "Show Volume Spikes",       group="Volume")
+volLen        = input.int(20,    "Volume MA Length",          minval=5, maxval=50, group="Volume")
+volSpikeMult  = input.float(2.0, "Volume Spike Multiplier",  minval=1.5, maxval=5.0, step=0.5, group="Volume")
+
+showSwings    = input.bool(true, "Show Swing Points",        group="Visuals")
+showTrend     = input.bool(true, "Color Bars by Trend",      group="Visuals")
+
+// ────────────────────────────────────────────────────────────
+// SWING HIGH / LOW DETECTION
+// ────────────────────────────────────────────────────────────
+
+// Pivot high: bar whose high is higher than swingLen bars on each side
+// Pivot low: bar whose low is lower than swingLen bars on each side
+// These are detected with a delay of swingLen bars (confirmation needed)
+
+swingHighVal = ta.pivothigh(high, swingLen, swingLen)
+swingLowVal  = ta.pivotlow(low, swingLen, swingLen)
+
+isSwingHigh = not na(swingHighVal)
+isSwingLow  = not na(swingLowVal)
+
+// Track the most recent swing high and low VALUES and BAR INDICES
+var float lastSwingHigh    = na
+var int   lastSwingHighBar = na
+var float lastSwingLow     = na
+var int   lastSwingLowBar  = na
+
+// Also track the previous swing high/low (for structure comparison)
+var float prevSwingHigh    = na
+var float prevSwingLow     = na
+
+if isSwingHigh
+    prevSwingHigh    := lastSwingHigh
+    lastSwingHigh    := swingHighVal
+    lastSwingHighBar := bar_index - swingLen
+
+if isSwingLow
+    prevSwingLow     := lastSwingLow
+    lastSwingLow     := swingLowVal
+    lastSwingLowBar  := bar_index - swingLen
+
+// Plot swing points
+plotshape(showSwings and isSwingHigh ? true : false, "Swing High",
+     shape.triangledown, location.abovebar, color.new(color.red, 40),
+     offset=-swingLen, size=size.tiny)
+plotshape(showSwings and isSwingLow ? true : false, "Swing Low",
+     shape.triangleup, location.belowbar, color.new(color.green, 40),
+     offset=-swingLen, size=size.tiny)
+
+// ────────────────────────────────────────────────────────────
+// BREAK OF STRUCTURE (BOS) + CHANGE OF CHARACTER (ChoCH)
+// ────────────────────────────────────────────────────────────
+
+// Track current trend direction
+// 1 = bullish (making higher highs), -1 = bearish (making lower lows)
+var int trend = 0
+
+// Bullish BOS: price closes above the last swing high
+bullBOS = not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+
+// Bearish BOS: price closes below the last swing low
+bearBOS = not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+
+// Determine if this is a BOS (continuation) or ChoCH (reversal)
+var bool isBullChoCH = false
+var bool isBearChoCH = false
+var bool isBullBOS   = false
+var bool isBearBOS   = false
+
+isBullChoCH := false
+isBearChoCH := false
+isBullBOS   := false
+isBearBOS   := false
+
+if bullBOS
+    if trend <= 0
+        isBullChoCH := true   // was bearish or neutral, now breaking bullish = CHARACTER CHANGE
+    else
+        isBullBOS := true     // was already bullish, continuing = STRUCTURE BREAK
+    trend := 1
+
+if bearBOS
+    if trend >= 0
+        isBearChoCH := true   // was bullish or neutral, now breaking bearish = CHARACTER CHANGE
+    else
+        isBearBOS := true     // was already bearish, continuing = STRUCTURE BREAK
+    trend := -1
+
+// ── BOS Labels ──
+if showBOS and isBullBOS
+    label.new(bar_index, low - (high - low) * 0.3,
+         "BOS",
+         style=label.style_label_up, color=color.new(#2196F3, 20),
+         textcolor=color.white, size=size.tiny)
+
+if showBOS and isBearBOS
+    label.new(bar_index, high + (high - low) * 0.3,
+         "BOS",
+         style=label.style_label_down, color=color.new(#2196F3, 20),
+         textcolor=color.white, size=size.tiny)
+
+// ── ChoCH Labels (more prominent — these are the key signals) ──
+if showChoCH and isBullChoCH
+    label.new(bar_index, low - (high - low) * 0.5,
+         "ChoCH",
+         style=label.style_label_up, color=color.new(#00e676, 0),
+         textcolor=color.white, size=size.small)
+
+if showChoCH and isBearChoCH
+    label.new(bar_index, high + (high - low) * 0.5,
+         "ChoCH",
+         style=label.style_label_down, color=color.new(#ff1744, 0),
+         textcolor=color.white, size=size.small)
+
+// ── BOS/ChoCH structure lines ──
+if showBOS and (isBullBOS or isBullChoCH) and not na(lastSwingHighBar)
+    line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
+         color=color.new(#00e676, 30), style=line.style_dashed, width=1)
+
+if showBOS and (isBearBOS or isBearChoCH) and not na(lastSwingLowBar)
+    line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
+         color=color.new(#ff1744, 30), style=line.style_dashed, width=1)
+
+// ────────────────────────────────────────────────────────────
+// ORDER BLOCKS
+// ────────────────────────────────────────────────────────────
+
+// Bullish OB: the last BEARISH candle before a bullish BOS/ChoCH
+// This is where institutions placed buy orders
+// Bearish OB: the last BULLISH candle before a bearish BOS/ChoCH
+// This is where institutions placed sell orders
+
+var box[] bullOBs = array.new_box()
+var box[] bearOBs = array.new_box()
+
+if showOB and (isBullBOS or isBullChoCH)
+    // Find the last bearish candle before this bar
+    obFound = false
+    for i = 1 to 10
+        if close[i] < open[i] and not obFound
+            obBox = box.new(bar_index - i, open[i], bar_index + obMaxAge, close[i],
+                 border_color=color.new(#00e676, 40),
+                 bgcolor=color.new(#00e676, 85),
+                 text="OB", text_color=color.new(#00e676, 40),
+                 text_size=size.tiny, text_halign=text.align_left)
+            array.push(bullOBs, obBox)
+            obFound := true
+
+if showOB and (isBearBOS or isBearChoCH)
+    // Find the last bullish candle before this bar
+    obFound = false
+    for i = 1 to 10
+        if close[i] > open[i] and not obFound
+            obBox = box.new(bar_index - i, close[i], bar_index + obMaxAge, open[i],
+                 border_color=color.new(#ff1744, 40),
+                 bgcolor=color.new(#ff1744, 85),
+                 text="OB", text_color=color.new(#ff1744, 40),
+                 text_size=size.tiny, text_halign=text.align_left)
+            array.push(bearOBs, obBox)
+            obFound := true
+
+// ── Remove mitigated order blocks ──
+// Bullish OB is mitigated when price drops through it (close < OB bottom)
+// Bearish OB is mitigated when price rises through it (close > OB top)
+
+if obMitigated and array.size(bullOBs) > 0
+    for i = array.size(bullOBs) - 1 to 0
+        if i < array.size(bullOBs)
+            b = array.get(bullOBs, i)
+            obBottom = box.get_bottom(b)
+            obAge = bar_index - box.get_left(b)
+            if close < obBottom or obAge > obMaxAge
+                box.delete(b)
+                array.remove(bullOBs, i)
+
+if obMitigated and array.size(bearOBs) > 0
+    for i = array.size(bearOBs) - 1 to 0
+        if i < array.size(bearOBs)
+            b = array.get(bearOBs, i)
+            obTop = box.get_top(b)
+            obAge = bar_index - box.get_left(b)
+            if close > obTop or obAge > obMaxAge
+                box.delete(b)
+                array.remove(bearOBs, i)
+
+// ────────────────────────────────────────────────────────────
+// VOLUME SPIKE DETECTION
+// ────────────────────────────────────────────────────────────
+
+volSMA    = ta.sma(volume, volLen)
+isVolSpike = volume > volSMA * volSpikeMult and volume > 0
+
+plotshape(showVolSpike and isVolSpike, "Vol Spike",
+     shape.circle, location.belowbar,
+     color=color.new(color.yellow, 30), size=size.tiny)
+
+// ────────────────────────────────────────────────────────────
+// BAR COLORING BY TREND
+// ────────────────────────────────────────────────────────────
+
+trendColor = trend == 1 ? color.new(#00e676, 70) :
+             trend == -1 ? color.new(#ff1744, 70) :
+             color.new(color.gray, 85)
+
+barcolor(showTrend ? trendColor : na, title="Trend Color")
+
+// ────────────────────────────────────────────────────────────
+// DASHBOARD
+// ────────────────────────────────────────────────────────────
+
+if barstate.islast
+    var table d = table.new(position.top_right, 2, 5,
+         bgcolor=color.new(color.black, 10),
+         border_color=color.new(color.gray, 50), border_width=1,
+         frame_color=color.new(color.gray, 30), frame_width=2)
+
+    gn = #00e676
+    rd = #ff1744
+    gr = color.gray
+    wh = color.white
+    yl = color.yellow
+
+    table.cell(d, 0, 0, "MICRO", text_color=yl, text_size=size.normal, bgcolor=color.new(color.black, 0))
+    table.cell(d, 1, 0, "STRUCTURE", text_color=yl, text_size=size.normal, bgcolor=color.new(color.black, 0))
+
+    // Trend
+    trendStr = trend == 1 ? "BULLISH" : trend == -1 ? "BEARISH" : "NEUTRAL"
+    trendClr = trend == 1 ? gn : trend == -1 ? rd : gr
+    table.cell(d, 0, 1, "Micro Trend", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 1, trendStr,      text_color=trendClr, text_size=size.small)
+
+    // Last swing high/low
+    table.cell(d, 0, 2, "Swing High", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 2, not na(lastSwingHigh) ? str.tostring(lastSwingHigh, "#.##") : "—",
+         text_color=wh, text_size=size.small)
+
+    table.cell(d, 0, 3, "Swing Low", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 3, not na(lastSwingLow) ? str.tostring(lastSwingLow, "#.##") : "—",
+         text_color=wh, text_size=size.small)
+
+    // Volume
+    volStr = isVolSpike ? "SPIKE" : "Normal"
+    table.cell(d, 0, 4, "Volume", text_color=wh, text_size=size.small)
+    table.cell(d, 1, 4, volStr,  text_color=isVolSpike ? yl : gr, text_size=size.small)
+
+// ────────────────────────────────────────────────────────────
+// ALERTS
+// ────────────────────────────────────────────────────────────
+
+alertcondition(isBullChoCH, "Bullish ChoCH", "XAUUSD: Bullish Change of Character — trend flipping long")
+alertcondition(isBearChoCH, "Bearish ChoCH", "XAUUSD: Bearish Change of Character — trend flipping short")
+alertcondition(isBullBOS,   "Bullish BOS",   "XAUUSD: Bullish Break of Structure — trend continuing long")
+alertcondition(isBearBOS,   "Bearish BOS",   "XAUUSD: Bearish Break of Structure — trend continuing short")
+
+// ────────────────────────────────────────────────────────────
+// HOW TO READ
+// ────────────────────────────────────────────────────────────
+//
+// SWING POINTS:
+//   Small red triangle above bar  = Swing High (resistance)
+//   Small green triangle below bar = Swing Low (support)
+//
+// STRUCTURE BREAKS:
+//   Blue "BOS" label  = Break of Structure (trend continues)
+//   Green "ChoCH" label below = Bullish Change of Character (trend FLIPS to long)
+//   Red "ChoCH" label above   = Bearish Change of Character (trend FLIPS to short)
+//   Dashed line = the swing level that was broken
+//
+// ORDER BLOCKS:
+//   Green box = Bullish OB (institutional buy zone — look to buy here)
+//   Red box   = Bearish OB (institutional sell zone — look to sell here)
+//   Boxes disappear when price trades through them (mitigated)
+//
+// VOLUME:
+//   Yellow dot below bar = Volume spike (>2x average — institutions active)
+//
+// BAR COLORS:
+//   Green tint = Bullish micro-trend
+//   Red tint   = Bearish micro-trend
+//   Gray       = No clear trend
+//
+// HOW TO TRADE:
+//   1. Check Liquidity Sweep indicator for daily bias
+//      (e.g., "Asian low was swept → buy bias today")
+//   2. On 1m/3m chart, wait for ChoCH in the SAME direction
+//      (e.g., Bullish ChoCH confirms the buy bias)
+//   3. Enter at the Order Block (green box) created by that ChoCH
+//   4. Stop below the swing low that created the ChoCH
+//   5. Target: next swing high or the Asian range level
+//
+// EXAMPLE:
+//   Liquidity Sweep says: "Asian low swept, watch for buy displacement"
+//   On 1m chart: price makes lower lows, then suddenly breaks above
+//   the last swing high → "ChoCH" label appears (bullish flip)
+//   A green OB box appears 3 bars back at $4,545-$4,547
+//   Price pulls back to $4,546 (into the OB) → ENTER LONG
+//   Stop: $4,543 (below the swing low)
+//   Target: $4,555 (next swing high or Asian range midpoint)
+// ============================================================

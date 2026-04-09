@@ -1,0 +1,444 @@
+// ============================================================
+// XAUUSD Scalping Signal Indicator
+// ============================================================
+// Timeframe: 15-minute (also works on 5m)
+// Instrument: XAUUSD (Gold/USD)
+//
+// Based on the claude-trading-skills workflow analysis:
+// - Session structure (Asian range → London breakout → NY continuation)
+// - VWAP retrace entries
+// - 9/21 EMA intraday trend
+// - Daily 50 EMA directional bias
+// - DXY inverse correlation filter
+// - RSI momentum confirmation
+// - Volume participation filter
+// - ATR-based stop/target placement
+//
+// Signals:
+//   BUY  = Price retraces to VWAP in an intraday uptrend during
+//          London/NY session, confirmed by momentum + volume + daily bias
+//   SELL = Price rallies to VWAP in an intraday downtrend during
+//          London/NY session, confirmed by momentum + volume + daily bias
+// ============================================================
+
+//@version=5
+indicator("XAUUSD Scalp Signal", overlay=true, max_labels_count=500, max_lines_count=200)
+
+// ────────────────────────────────────────────────────────────
+// INPUTS
+// ────────────────────────────────────────────────────────────
+
+// -- Trend --
+emaFast         = input.int(9,     "Fast EMA",              minval=3,  maxval=50,  group="Trend")
+emaSlow         = input.int(21,    "Slow EMA",              minval=10, maxval=100, group="Trend")
+dailyEmaLen     = input.int(50,    "Daily EMA (bias)",      minval=20, maxval=200, group="Trend")
+
+// -- VWAP --
+showVwap        = input.bool(true, "Show VWAP",                                     group="VWAP")
+vwapBandMult    = input.float(1.0, "VWAP Band Multiplier",  minval=0.5, maxval=3.0, group="VWAP", step=0.1)
+
+// -- Momentum --
+rsiLen          = input.int(14,    "RSI Length",             minval=5,  maxval=30,  group="Momentum")
+rsiBuyThresh    = input.int(40,    "RSI Buy Threshold",     minval=25, maxval=50,  group="Momentum")
+rsiSellThresh   = input.int(60,    "RSI Sell Threshold",    minval=50, maxval=75,  group="Momentum")
+
+// -- Volume --
+volLen          = input.int(20,    "Volume MA Length",       minval=5,  maxval=50,  group="Volume")
+volMult         = input.float(1.0, "Volume Filter Multiple", minval=0.5, maxval=3.0, group="Volume", step=0.1)
+
+// -- Risk --
+atrLen          = input.int(14,    "ATR Length",             minval=5,  maxval=30,  group="Risk")
+atrStopMult     = input.float(1.5, "ATR Stop Multiplier",   minval=0.5, maxval=4.0, group="Risk", step=0.1)
+rrRatio         = input.float(1.5, "Reward:Risk Ratio",     minval=1.0, maxval=5.0, group="Risk", step=0.1)
+
+// -- Sessions (exchange timezone, adjust for your broker) --
+asianSess       = input.session("2000-0200", "Asian Session",  group="Sessions")
+londonSess      = input.session("0300-0800", "London Session", group="Sessions")
+nySess          = input.session("0830-1500", "New York Session", group="Sessions")
+showSessions    = input.bool(true, "Show Session Background",                       group="Sessions")
+
+// -- Filters --
+useDxyFilter    = input.bool(true,  "Use DXY Correlation Filter",                    group="Filters")
+dxySymbol       = input.string("TVC:DXY", "DXY Symbol",                             group="Filters")
+dxyEmaLen       = input.int(21,     "DXY EMA Length",        minval=5, maxval=50,    group="Filters")
+requireActiveSession = input.bool(true, "Signals Only in London/NY",                 group="Filters")
+
+// -- Visuals --
+showDashboard   = input.bool(true, "Show Dashboard",                                 group="Visuals")
+showStopTarget  = input.bool(true, "Show Stop/Target Levels",                        group="Visuals")
+showPrevDayHL   = input.bool(true, "Show Previous Day High/Low",                     group="Visuals")
+maxSignalsPerDay = input.int(6,    "Max Signals Per Session", minval=1, maxval=20,   group="Visuals")
+
+// ────────────────────────────────────────────────────────────
+// SESSION DETECTION
+// ────────────────────────────────────────────────────────────
+
+inAsian  = not na(time(timeframe.period, asianSess))
+inLondon = not na(time(timeframe.period, londonSess))
+inNY     = not na(time(timeframe.period, nySess))
+inActiveSession = inLondon or inNY
+
+// Session background coloring
+asianColor  = color.new(color.gray,   93)
+londonColor = color.new(color.blue,   93)
+nyColor     = color.new(color.orange, 93)
+
+bgcolor(showSessions and inAsian  ? asianColor  : na, title="Asian Session")
+bgcolor(showSessions and inLondon ? londonColor : na, title="London Session")
+bgcolor(showSessions and inNY     ? nyColor     : na, title="NY Session")
+
+// ────────────────────────────────────────────────────────────
+// SESSION HIGH / LOW TRACKING
+// ────────────────────────────────────────────────────────────
+
+var float sessionHigh = na
+var float sessionLow  = na
+
+isNewDay = ta.change(time("D")) != 0
+
+if isNewDay
+    sessionHigh := high
+    sessionLow  := low
+else
+    sessionHigh := math.max(nz(sessionHigh, high), high)
+    sessionLow  := math.min(nz(sessionLow, low), low)
+
+// ────────────────────────────────────────────────────────────
+// PREVIOUS DAY HIGH / LOW / CLOSE
+// ────────────────────────────────────────────────────────────
+
+prevDayHigh  = request.security(syminfo.tickerid, "D", high[1],  lookahead=barmerge.lookahead_on)
+prevDayLow   = request.security(syminfo.tickerid, "D", low[1],   lookahead=barmerge.lookahead_on)
+prevDayClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+plot(showPrevDayHL ? prevDayHigh  : na, "Prev Day High",  color=color.new(color.red,   50), style=plot.style_stepline, linewidth=1)
+plot(showPrevDayHL ? prevDayLow   : na, "Prev Day Low",   color=color.new(color.green, 50), style=plot.style_stepline, linewidth=1)
+plot(showPrevDayHL ? prevDayClose : na, "Prev Day Close",  color=color.new(color.gray,  50), style=plot.style_stepline, linewidth=1)
+
+// ────────────────────────────────────────────────────────────
+// HIGHER TIMEFRAME BIAS (Daily 50 EMA)
+// ────────────────────────────────────────────────────────────
+
+dailyEma    = request.security(syminfo.tickerid, "D", ta.ema(close, dailyEmaLen), lookahead=barmerge.lookahead_off)
+dailyClose  = request.security(syminfo.tickerid, "D", close, lookahead=barmerge.lookahead_off)
+
+dailyBullish = dailyClose > dailyEma
+dailyBearish = dailyClose < dailyEma
+
+// ────────────────────────────────────────────────────────────
+// DXY CORRELATION FILTER
+// ────────────────────────────────────────────────────────────
+
+dxyClose = request.security(dxySymbol, timeframe.period, close, lookahead=barmerge.lookahead_off)
+dxyEma   = request.security(dxySymbol, timeframe.period, ta.ema(close, dxyEmaLen), lookahead=barmerge.lookahead_off)
+
+dxyRising  = dxyClose > dxyEma   // DXY strong → headwind for gold longs
+dxyFalling = dxyClose < dxyEma   // DXY weak  → tailwind for gold longs
+
+// Filter logic: DXY falling favors gold longs, DXY rising favors gold shorts
+dxyAllowLong  = useDxyFilter ? not dxyRising  : true
+dxyAllowShort = useDxyFilter ? not dxyFalling : true
+
+// ────────────────────────────────────────────────────────────
+// INTRADAY TREND (9/21 EMA)
+// ────────────────────────────────────────────────────────────
+
+ema9  = ta.ema(close, emaFast)
+ema21 = ta.ema(close, emaSlow)
+
+emaBullish = ema9 > ema21
+emaBearish = ema9 < ema21
+
+plot(ema9,  "Fast EMA", color=emaBullish ? color.new(color.green, 30) : color.new(color.red, 30), linewidth=2)
+plot(ema21, "Slow EMA", color=emaBullish ? color.new(color.green, 60) : color.new(color.red, 60), linewidth=1)
+
+// ────────────────────────────────────────────────────────────
+// VWAP + BANDS
+// ────────────────────────────────────────────────────────────
+
+vwapValue = ta.vwap(hlc3)
+vwapDev   = ta.stdev(close - vwapValue, 20) * vwapBandMult
+vwapUpper = vwapValue + vwapDev
+vwapLower = vwapValue - vwapDev
+
+vwapPlot  = plot(showVwap ? vwapValue : na, "VWAP",       color=color.new(color.purple, 20), linewidth=2)
+vwapUPlot = plot(showVwap ? vwapUpper : na, "VWAP Upper", color=color.new(color.purple, 70), linewidth=1, style=plot.style_circles)
+vwapLPlot = plot(showVwap ? vwapLower : na, "VWAP Lower", color=color.new(color.purple, 70), linewidth=1, style=plot.style_circles)
+fill(vwapUPlot, vwapLPlot, color=color.new(color.purple, 93), title="VWAP Band Fill")
+
+// VWAP retrace detection
+priceAboveVwap  = close > vwapValue
+priceBelowVwap  = close < vwapValue
+touchedVwapFromAbove = low <= vwapValue and close > vwapValue   // wick touched VWAP, closed above
+touchedVwapFromBelow = high >= vwapValue and close < vwapValue  // wick touched VWAP, closed below
+crossedAboveVwap = ta.crossover(close, vwapValue)
+crossedBelowVwap = ta.crossunder(close, vwapValue)
+
+vwapBuySetup  = touchedVwapFromAbove or crossedAboveVwap
+vwapSellSetup = touchedVwapFromBelow or crossedBelowVwap
+
+// ────────────────────────────────────────────────────────────
+// RSI MOMENTUM
+// ────────────────────────────────────────────────────────────
+
+rsiValue = ta.rsi(close, rsiLen)
+
+// Buy: RSI was recently oversold and is recovering
+rsiWasLow  = ta.lowest(rsiValue, 5) < rsiBuyThresh
+rsiBuyOk   = rsiValue > rsiBuyThresh and rsiWasLow
+
+// Sell: RSI was recently overbought and is declining
+rsiWasHigh = ta.highest(rsiValue, 5) > rsiSellThresh
+rsiSellOk  = rsiValue < rsiSellThresh and rsiWasHigh
+
+// ────────────────────────────────────────────────────────────
+// VOLUME CONFIRMATION
+// ────────────────────────────────────────────────────────────
+
+volSma    = ta.sma(volume, volLen)
+volActive = volume > volSma * volMult
+
+// ────────────────────────────────────────────────────────────
+// ATR (for stops and targets)
+// ────────────────────────────────────────────────────────────
+
+atrValue = ta.atr(atrLen)
+
+// ────────────────────────────────────────────────────────────
+// SIGNAL RATE LIMITER
+// Prevent signal spam: max N signals per calendar day
+// ────────────────────────────────────────────────────────────
+
+var int dailyBuyCount  = 0
+var int dailySellCount = 0
+
+if isNewDay
+    dailyBuyCount  := 0
+    dailySellCount := 0
+
+// ────────────────────────────────────────────────────────────
+// COMBINED SIGNAL LOGIC
+// ────────────────────────────────────────────────────────────
+
+// ---- BUY CONDITIONS ----
+// 1. Daily trend is bullish (price > daily 50 EMA)
+// 2. Intraday trend is bullish (9 EMA > 21 EMA)
+// 3. Price retraces to VWAP and bounces (wick touch or cross-back)
+// 4. RSI was recently oversold and is recovering
+// 5. Volume is above average
+// 6. In London or NY session (not low-vol Asian)
+// 7. DXY is not rising (no headwind)
+// 8. Not exceeded max signals for the day
+
+buySignal = dailyBullish and
+     emaBullish and
+     vwapBuySetup and
+     rsiBuyOk and
+     volActive and
+     (requireActiveSession ? inActiveSession : true) and
+     dxyAllowLong and
+     dailyBuyCount < maxSignalsPerDay
+
+// ---- SELL CONDITIONS ----
+// Mirror of buy conditions for short side
+
+sellSignal = dailyBearish and
+     emaBearish and
+     vwapSellSetup and
+     rsiSellOk and
+     volActive and
+     (requireActiveSession ? inActiveSession : true) and
+     dxyAllowShort and
+     dailySellCount < maxSignalsPerDay
+
+// Update counters
+if buySignal
+    dailyBuyCount += 1
+
+if sellSignal
+    dailySellCount += 1
+
+// ────────────────────────────────────────────────────────────
+// STOP / TARGET LEVELS
+// ────────────────────────────────────────────────────────────
+
+buyStop     = buySignal  ? low  - atrValue * atrStopMult : na
+buyTarget   = buySignal  ? close + (close - (low  - atrValue * atrStopMult)) * rrRatio : na
+
+sellStop    = sellSignal ? high + atrValue * atrStopMult : na
+sellTarget  = sellSignal ? close - ((high + atrValue * atrStopMult) - close) * rrRatio : na
+
+// ────────────────────────────────────────────────────────────
+// SIGNAL PLOTS
+// ────────────────────────────────────────────────────────────
+
+plotshape(buySignal,  "Buy Signal",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.normal)
+plotshape(sellSignal, "Sell Signal", shape.triangledown,  location.abovebar, color.new(color.red, 0),   size=size.normal)
+
+// Stop and target lines (drawn as labels for clarity)
+if buySignal and showStopTarget
+    label.new(bar_index, buyStop,   "SL " + str.tostring(buyStop,   "#.##"), style=label.style_label_up,   color=color.new(color.red,   20), textcolor=color.white, size=size.small)
+    label.new(bar_index, buyTarget, "TP " + str.tostring(buyTarget, "#.##"), style=label.style_label_down, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+
+if sellSignal and showStopTarget
+    label.new(bar_index, sellStop,   "SL " + str.tostring(sellStop,   "#.##"), style=label.style_label_down, color=color.new(color.red,   20), textcolor=color.white, size=size.small)
+    label.new(bar_index, sellTarget, "TP " + str.tostring(sellTarget, "#.##"), style=label.style_label_up,   color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+
+// ────────────────────────────────────────────────────────────
+// BAR COLORING (optional visual trend confirmation)
+// ────────────────────────────────────────────────────────────
+
+trendColor = emaBullish and dailyBullish ? color.new(color.green, 80) :
+             emaBearish and dailyBearish ? color.new(color.red, 80) :
+             color.new(color.gray, 90)
+
+barcolor(trendColor, title="Trend Bar Color")
+
+// ────────────────────────────────────────────────────────────
+// DASHBOARD TABLE
+// ────────────────────────────────────────────────────────────
+
+if showDashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 12,
+         bgcolor=color.new(color.black, 15),
+         border_color=color.new(color.gray, 50),
+         border_width=1,
+         frame_color=color.new(color.gray, 30),
+         frame_width=2)
+
+    // Helper colors
+    bullColor = color.green
+    bearColor = color.red
+    neutColor = color.gray
+
+    // Header
+    table.cell(dash, 0, 0, "XAUUSD SCALP", text_color=color.new(color.yellow, 0), text_size=size.normal, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 0, "DASHBOARD",     text_color=color.new(color.yellow, 0), text_size=size.normal, bgcolor=color.new(color.black, 0))
+
+    // Row 1: Daily Bias
+    table.cell(dash, 0, 1, "Daily Bias",      text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, dailyBullish ? "BULLISH" : dailyBearish ? "BEARISH" : "NEUTRAL",
+         text_color=dailyBullish ? bullColor : dailyBearish ? bearColor : neutColor, text_size=size.small)
+
+    // Row 2: Intraday Trend
+    table.cell(dash, 0, 2, "Intraday Trend",  text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, emaBullish ? "UP (9>21)" : "DOWN (9<21)",
+         text_color=emaBullish ? bullColor : bearColor, text_size=size.small)
+
+    // Row 3: Session
+    sessionStr = inLondon ? "LONDON" : inNY ? "NEW YORK" : inAsian ? "ASIAN" : "OFF-HOURS"
+    sessionClr = inLondon ? color.blue : inNY ? color.orange : inAsian ? neutColor : color.new(color.gray, 50)
+    table.cell(dash, 0, 3, "Session",          text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, sessionStr,         text_color=sessionClr,  text_size=size.small)
+
+    // Row 4: VWAP Position
+    vwapPos = close > vwapValue ? "ABOVE" : "BELOW"
+    table.cell(dash, 0, 4, "Price vs VWAP",   text_color=color.white,  text_size=size.small)
+    table.cell(dash, 1, 4, vwapPos,            text_color=close > vwapValue ? bullColor : bearColor, text_size=size.small)
+
+    // Row 5: RSI
+    rsiStr = str.tostring(rsiValue, "#.#")
+    rsiClr = rsiValue > 60 ? bearColor : rsiValue < 40 ? bullColor : neutColor
+    table.cell(dash, 0, 5, "RSI (" + str.tostring(rsiLen) + ")", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, rsiStr,             text_color=rsiClr, text_size=size.small)
+
+    // Row 6: Volume
+    volStr = volActive ? "ACTIVE" : "LOW"
+    table.cell(dash, 0, 6, "Volume",           text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, volStr,             text_color=volActive ? bullColor : neutColor, text_size=size.small)
+
+    // Row 7: DXY
+    dxyStr = useDxyFilter ? (dxyRising ? "RISING (gold headwind)" : "FALLING (gold tailwind)") : "DISABLED"
+    dxyClr = useDxyFilter ? (dxyRising ? bearColor : bullColor) : neutColor
+    table.cell(dash, 0, 7, "DXY",             text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, dxyStr,            text_color=dxyClr, text_size=size.small)
+
+    // Row 8: ATR
+    table.cell(dash, 0, 8, "ATR (" + str.tostring(atrLen) + ")", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 8, str.tostring(atrValue, "#.##"),        text_color=color.white, text_size=size.small)
+
+    // Row 9: Today's Signals
+    table.cell(dash, 0, 9, "Signals Today",    text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 9, "B:" + str.tostring(dailyBuyCount) + " S:" + str.tostring(dailySellCount),
+         text_color=color.white, text_size=size.small)
+
+    // Row 10: Session Range
+    table.cell(dash, 0, 10, "Session Range",   text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 10, str.tostring(sessionHigh, "#.##") + " / " + str.tostring(sessionLow, "#.##"),
+         text_color=color.white, text_size=size.small)
+
+    // Row 11: Verdict
+    verdictStr = emaBullish and dailyBullish and dxyAllowLong  ? "SCALP LONG"  :
+                 emaBearish and dailyBearish and dxyAllowShort ? "SCALP SHORT" :
+                 "WAIT / NO EDGE"
+    verdictClr = emaBullish and dailyBullish and dxyAllowLong  ? bullColor :
+                 emaBearish and dailyBearish and dxyAllowShort ? bearColor :
+                 neutColor
+    table.cell(dash, 0, 11, "VERDICT",         text_color=color.yellow, text_size=size.normal, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 11, verdictStr,        text_color=verdictClr,   text_size=size.normal, bgcolor=color.new(color.black, 0))
+
+// ────────────────────────────────────────────────────────────
+// ALERTS
+// ────────────────────────────────────────────────────────────
+
+alertcondition(buySignal,  "XAUUSD Buy Signal",  "XAUUSD SCALP BUY: VWAP retrace in uptrend. Check dashboard for levels.")
+alertcondition(sellSignal, "XAUUSD Sell Signal",  "XAUUSD SCALP SELL: VWAP rejection in downtrend. Check dashboard for levels.")
+
+alertcondition(inLondon and not inLondon[1], "London Open",  "London session open -- primary scalping window begins.")
+alertcondition(inNY and not inNY[1],         "NY Open",      "New York session open -- check for continuation or reversal.")
+
+// ────────────────────────────────────────────────────────────
+// NOTES
+// ────────────────────────────────────────────────────────────
+//
+// SETUP:
+// 1. Apply to XAUUSD (OANDA, FOREXCOM, or COMEX GC1!) on 15-minute chart
+// 2. Adjust session times in Settings if your broker uses a different timezone
+//    - Default sessions assume US Eastern Time (ET)
+//    - Asian: 8:00 PM - 2:00 AM ET
+//    - London: 3:00 AM - 8:00 AM ET
+//    - New York: 8:30 AM - 3:00 PM ET
+// 3. DXY filter uses TVC:DXY by default; change if your platform uses a different symbol
+//
+// HOW TO READ:
+// - Green triangle below bar = BUY signal (go long)
+// - Red triangle above bar   = SELL signal (go short)
+// - Green SL/TP labels       = suggested stop-loss and take-profit for longs
+// - Red SL/TP labels         = suggested stop-loss and take-profit for shorts
+// - Dashboard VERDICT shows current bias: SCALP LONG / SCALP SHORT / WAIT
+//
+// SESSION COLORS:
+// - Gray background   = Asian session (low volatility, avoid or use range-fades)
+// - Blue background   = London session (breakout session, primary scalping window)
+// - Orange background = New York session (news-driven, continuation or reversal)
+//
+// RISK MANAGEMENT:
+// - Risk 0.25-0.5% per scalp (not 1% -- scalping frequency requires tighter risk)
+// - Daily loss limit: stop trading if down 2% for the day
+// - Max 6 signals per session by default (prevents overtrading)
+// - Do NOT scalp 15 min before/after High Impact economic events (CPI, NFP, FOMC)
+//   -- check economic-calendar-fetcher output for kill zones
+//
+// SIGNAL LOGIC SUMMARY:
+// BUY requires ALL of:
+//   [1] Price above Daily 50 EMA (bullish macro bias)
+//   [2] 9 EMA above 21 EMA (intraday uptrend)
+//   [3] Price touches/crosses VWAP and closes above (retrace entry)
+//   [4] RSI recently dipped below 40 and recovered (momentum reset)
+//   [5] Volume above 20-period average (participation confirmed)
+//   [6] In London or NY session (sufficient liquidity)
+//   [7] DXY not rising (no USD headwind against gold)
+//
+// SELL requires ALL of the inverse conditions.
+//
+// WHAT THIS DOES NOT DO:
+// - Does not detect economic calendar events (use economic-calendar-fetcher skill)
+// - Does not replace order flow / DOM analysis for execution timing
+// - Does not manage positions or calculate lot sizes (use position-sizer skill)
+// - Does not journal trades (use trader-memory-core / signal-postmortem skills)
+//
+// DISCLAIMER:
+// This indicator is for educational purposes. It does not constitute financial
+// advice. Past performance does not guarantee future results. Always use
+// proper risk management and never risk more than you can afford to lose.
+// ============================================================

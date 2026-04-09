@@ -1,0 +1,204 @@
+// ============================================================
+// BOS + FVG Strategy v2 (Backtestable)
+// Same logic as the indicator, with strategy.entry/exit for testing.
+// Load on TradingView, click "Strategy Tester" tab for results.
+// ============================================================
+
+//@version=5
+strategy("BOS+FVG Strategy v2", overlay=true,
+     initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=15,
+     commission_type=strategy.commission.cash_per_order, commission_value=3.5,
+     slippage=3, pyramiding=0, calc_on_every_tick=false)
+
+// ── INPUTS ──
+swingLen        = input.int(5, "Swing Lookback", minval=2, maxval=8, group="Structure")
+useHTFFilter    = input.bool(true, "HTF Trend Filter", group="HTF")
+htfTimeframe    = input.string("60", "HTF Timeframe", options=["15","30","60","120","240"], group="HTF")
+htfEmaLen       = input.int(50, "HTF EMA Length", minval=10, maxval=200, group="HTF")
+usePDZones      = input.bool(true, "Premium/Discount Filter", group="P/D")
+pdLookback      = input.int(100, "Range Lookback", minval=20, maxval=500, group="P/D")
+fvgMaxBars      = input.int(5, "FVG Search Window", minval=2, maxval=10, group="FVG")
+fvgMaxAge       = input.int(50, "FVG Max Age", minval=10, maxval=200, group="FVG")
+fvgMinSizeATR   = input.float(0.3, "Min FVG Size (xATR)", minval=0.1, maxval=2.0, step=0.1, group="FVG")
+fvgStackLimit   = input.int(2, "Max FVGs per Direction", minval=1, maxval=5, group="FVG")
+useDispQuality  = input.bool(true, "Strong BOS Only", group="FVG")
+dispQualityMult = input.float(1.5, "BOS Body (x avg)", minval=1.0, maxval=4.0, step=0.1, group="FVG")
+requireRejection = input.bool(true, "Require Rejection", group="Entry")
+cooldownBars    = input.int(6, "Cooldown (bars)", minval=3, maxval=20, group="Entry")
+rrRatio         = input.float(2.0, "R:R Ratio", minval=1.0, maxval=5.0, step=0.5, group="Risk")
+maxBarsInTrade  = input.int(8, "Max Bars in Trade", minval=2, maxval=20, group="Risk")
+useTimeFilter   = input.bool(true, "Time Filter", group="Time")
+blockHours      = input.string("2,11,17,22", "Blocked Hours UTC", group="Time")
+maxSignalsDay   = input.int(6, "Max Signals/Day", minval=1, maxval=20, group="Risk")
+
+// ── TIME FILTER ──
+currentHour = hour(time, "UTC")
+isBlockedHour = false
+if useTimeFilter
+    blockedArr = str.split(blockHours, ",")
+    for i = 0 to array.size(blockedArr) - 1
+        h = str.tonumber(array.get(blockedArr, i))
+        if not na(h) and currentHour == h
+            isBlockedHour := true
+
+// ── HTF ALIGNMENT ──
+htfEma     = request.security(syminfo.tickerid, htfTimeframe, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+htfClose   = request.security(syminfo.tickerid, htfTimeframe, close, lookahead=barmerge.lookahead_off)
+htfAllowBuy  = useHTFFilter ? htfClose > htfEma : true
+htfAllowSell = useHTFFilter ? htfClose < htfEma : true
+
+// ── SWINGS ──
+swingHighVal = ta.pivothigh(high, swingLen, swingLen)
+swingLowVal  = ta.pivotlow(low, swingLen, swingLen)
+var float lastSH = na
+var float lastSL = na
+if not na(swingHighVal)
+    lastSH := swingHighVal
+if not na(swingLowVal)
+    lastSL := swingLowVal
+
+// ── PREMIUM/DISCOUNT ──
+rangeMid    = (ta.highest(high, pdLookback) + ta.lowest(low, pdLookback)) / 2
+pdAllowBuy  = usePDZones ? close < rangeMid : true
+pdAllowSell = usePDZones ? close > rangeMid : true
+
+// ── BOS ──
+bullBOS = not na(lastSH) and close > lastSH and close[1] <= lastSH
+bearBOS = not na(lastSL) and close < lastSL and close[1] >= lastSL
+
+var int   bosDir  = 0
+var int   bosBar  = na
+var float bosBody = na
+if bullBOS
+    bosDir  := 1
+    bosBar  := bar_index
+    bosBody := math.abs(close - open)
+if bearBOS
+    bosDir  := -1
+    bosBar  := bar_index
+    bosBody := math.abs(close - open)
+
+// ── FVG DETECTION ──
+fvgATR     = ta.atr(14)
+avgBody    = ta.sma(math.abs(close - open), 20)
+strongBOS  = useDispQuality ? (not na(bosBody) and bosBody > avgBody * dispQualityMult) : true
+barsSinceBOS = not na(bosBar) ? bar_index - bosBar : 999
+nearBOS    = barsSinceBOS <= fvgMaxBars
+
+rawBullFVG = low > high[2] and close[1] > open[1]
+rawBearFVG = high < low[2] and close[1] < open[1]
+bullFVG = rawBullFVG and nearBOS and bosDir == 1 and (rawBullFVG ? low - high[2] : 0) >= fvgATR * fvgMinSizeATR and strongBOS
+bearFVG = rawBearFVG and nearBOS and bosDir == -1 and (rawBearFVG ? low[2] - high : 0) >= fvgATR * fvgMinSizeATR and strongBOS
+
+var float[] fvgTop = array.new_float()
+var float[] fvgBot = array.new_float()
+var int[]   fvgBarArr = array.new_int()
+var int[]   fvgDirArr = array.new_int()
+var bool[]  fvgUsed = array.new_bool()
+
+if bullFVG
+    array.push(fvgTop, low)
+    array.push(fvgBot, high[2])
+    array.push(fvgBarArr, bar_index)
+    array.push(fvgDirArr, 1)
+    array.push(fvgUsed, false)
+if bearFVG
+    array.push(fvgTop, low[2])
+    array.push(fvgBot, high)
+    array.push(fvgBarArr, bar_index)
+    array.push(fvgDirArr, -1)
+    array.push(fvgUsed, false)
+
+// ── ENTRY LOGIC ──
+isNewDay = ta.change(time("D")) != 0
+var int dailySigs = 0
+if isNewDay
+    dailySigs := 0
+
+var int lastBuyBar  = na
+var int lastSellBar = na
+
+buyRejection  = close > open and close > (high + low) / 2
+sellRejection = close < open and close < (high + low) / 2
+
+buySignal  = false
+sellSignal = false
+var float entryP = na
+var float stopP  = na
+var float targP  = na
+
+if array.size(fvgTop) > 0
+    bullIdx = 0
+    bearIdx = 0
+    for i = array.size(fvgTop) - 1 to 0
+        if i >= array.size(fvgTop)
+            continue
+        ft = array.get(fvgTop, i)
+        fb = array.get(fvgBot, i)
+        fi = array.get(fvgBarArr, i)
+        fd = array.get(fvgDirArr, i)
+        fu = array.get(fvgUsed, i)
+        age = bar_index - fi
+
+        // Cleanup
+        if age > fvgMaxAge or (fd == 1 and close < fb) or (fd == -1 and close > ft)
+            array.remove(fvgTop, i)
+            array.remove(fvgBot, i)
+            array.remove(fvgBarArr, i)
+            array.remove(fvgDirArr, i)
+            array.remove(fvgUsed, i)
+            continue
+
+        // Stack limit
+        tradeable = false
+        if fd == 1
+            bullIdx += 1
+            tradeable := bullIdx <= fvgStackLimit
+        if fd == -1
+            bearIdx += 1
+            tradeable := bearIdx <= fvgStackLimit
+        if not tradeable or fu or age < 1 or age > 40 or isBlockedHour or dailySigs >= maxSignalsDay
+            continue
+
+        recentS = not na(lastSellBar) and (bar_index - lastSellBar) <= cooldownBars
+        recentB = not na(lastBuyBar) and (bar_index - lastBuyBar) <= cooldownBars
+
+        // BUY
+        bTouch = fd == 1 and low <= ft and close > fb
+        bConf  = requireRejection ? (bTouch and buyRejection) : bTouch
+        if bConf and not buySignal and not recentS and not recentB and htfAllowBuy and pdAllowBuy and
+             strategy.position_size == 0
+            buySignal := true
+            entryP    := (ft + fb) / 2
+            stopP     := fb - (ft - fb) * 0.5
+            targP     := entryP + (entryP - stopP) * rrRatio
+            array.set(fvgUsed, i, true)
+            dailySigs += 1
+            lastBuyBar := bar_index
+
+        // SELL
+        sTouch = fd == -1 and high >= fb and close < ft
+        sConf  = requireRejection ? (sTouch and sellRejection) : sTouch
+        if sConf and not sellSignal and not recentB and not recentS and htfAllowSell and pdAllowSell and
+             strategy.position_size == 0
+            sellSignal := true
+            entryP     := (ft + fb) / 2
+            stopP      := ft + (ft - fb) * 0.5
+            targP      := entryP - (stopP - entryP) * rrRatio
+            array.set(fvgUsed, i, true)
+            dailySigs += 1
+            lastSellBar := bar_index
+
+// ── STRATEGY EXECUTION ──
+if buySignal
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", "Long", stop=stopP, limit=targP)
+
+if sellSignal
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", "Short", stop=stopP, limit=targP)
+
+// Time stop
+barsSinceEntry = strategy.position_size != 0 ? bar_index - strategy.opentrades.entry_bar_index(0) : 0
+if strategy.position_size != 0 and barsSinceEntry >= maxBarsInTrade
+    strategy.close_all(comment="Time Stop")
